@@ -5,6 +5,7 @@ on:
     branches: [ "main", "dev", "x" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -100,3 +101,50 @@ jobs:
 
       - name: Build
         run: cargo build --all-features
+
+  build-windows:
+    needs: test
+    name: cargo build / windows
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      # Cache Cargo dependencies
+      - name: Cache Cargo dependencies
+        id: cache-cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      
+      # Cache Scoop installations
+      - name: Cache Scoop installations
+        id: cache-scoop
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/scoop
+            ~\scoop
+          key: ${{ runner.os }}-scoop-packages-${{ hashFiles('.github/workflows/rust-ci.yml') }}
+        
+      - name: Setup Scoop
+        uses: MinoruSekine/setup-scoop@v4.0.1
+        with:
+          install_scoop: ${{ steps.cache-scoop.outputs.cache-hit != 'true' }}
+          buckets: extras
+          apps: ffmpeg protobuf
+          update_path: true
+          
+      - name: Build
+        run: cargo build --all-features
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}\scoop\apps\ffmpeg\current
