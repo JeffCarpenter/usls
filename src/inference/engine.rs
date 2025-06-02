@@ -34,6 +34,8 @@ impl From<TensorElementType> for DType {
             TensorElementType::Bfloat16 => Self::Bf16,
             TensorElementType::String => Self::String,
             TensorElementType::Bool => Self::Bool,
+            // TODO: Add proper mapping for new types if needed, defaulting to Auto for now
+            _ => Self::Auto,
         }
     }
 }
@@ -231,7 +233,7 @@ impl Engine {
 
     pub fn run(&mut self, xs: Xs) -> Result<Xs> {
         let mut ys = xs.derive();
-        if let Some(onnx) = &self.onnx {
+        if let Some(onnx) = &mut self.onnx {
             // alignment
             let xs_ = elapsed!(&format!("[{}] ort_preprocessing", self.spec), self.ts, {
                 let mut xs_ = Vec::new();
@@ -245,11 +247,14 @@ impl Engine {
             });
 
             // run
-            let outputs = elapsed!(
-                &format!("[{}] ort_inference", self.spec),
-                self.ts,
-                onnx.session.run(&xs_[..])?
-            );
+            let outputs = {
+                let start_time = std::time::Instant::now();
+                let result = onnx.session.run(&xs_[..]);
+                let duration = start_time.elapsed();
+                let label = format!("[{}] ort_inference", self.spec);
+                self.ts.push(&label, duration);
+                result?
+            };
 
             // extract
             elapsed!(&format!("[{}] ort_postprocessing", self.spec), self.ts, {
@@ -266,73 +271,81 @@ impl Engine {
     }
 
     fn preprocess(x: &X, dtype: &TensorElementType) -> Result<DynValue> {
-        let x = match dtype {
-            TensorElementType::Float32 => Value::from_array(x.view())?.into_dyn(),
+        let x_val = match dtype {
+            TensorElementType::Float32 => Value::from_array(x.0.to_owned())?.into_dyn(),
             TensorElementType::Float16 => {
-                Value::from_array(x.mapv(f16::from_f32).view())?.into_dyn()
+                Value::from_array(x.mapv(f16::from_f32))?.into_dyn()
             }
-            TensorElementType::Float64 => Value::from_array(x.view())?.into_dyn(),
+            TensorElementType::Float64 => Value::from_array(x.mapv(|v_f32| v_f32 as f64))?.into_dyn(),
             TensorElementType::Bfloat16 => {
-                Value::from_array(x.mapv(bf16::from_f32).view())?.into_dyn()
+                Value::from_array(x.mapv(bf16::from_f32))?.into_dyn()
             }
-            TensorElementType::Int8 => Value::from_array(x.mapv(|x_| x_ as i8).view())?.into_dyn(),
+            TensorElementType::Int8 => Value::from_array(x.mapv(|x_| x_ as i8))?.into_dyn(),
             TensorElementType::Int16 => {
-                Value::from_array(x.mapv(|x_| x_ as i16).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as i16))?.into_dyn()
             }
             TensorElementType::Int32 => {
-                Value::from_array(x.mapv(|x_| x_ as i32).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as i32))?.into_dyn()
             }
             TensorElementType::Int64 => {
-                Value::from_array(x.mapv(|x_| x_ as i64).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as i64))?.into_dyn()
             }
-            TensorElementType::Uint8 => Value::from_array(x.mapv(|x_| x_ as u8).view())?.into_dyn(),
+            TensorElementType::Uint8 => Value::from_array(x.mapv(|x_| x_ as u8))?.into_dyn(),
             TensorElementType::Uint16 => {
-                Value::from_array(x.mapv(|x_| x_ as u16).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as u16))?.into_dyn()
             }
             TensorElementType::Uint32 => {
-                Value::from_array(x.mapv(|x_| x_ as u32).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as u32))?.into_dyn()
             }
             TensorElementType::Uint64 => {
-                Value::from_array(x.mapv(|x_| x_ as u64).view())?.into_dyn()
+                Value::from_array(x.mapv(|x_| x_ as u64))?.into_dyn()
             }
-            TensorElementType::Bool => Value::from_array(x.mapv(|x_| x_ != 0.).view())?.into_dyn(),
-            _ => unimplemented!(),
+            TensorElementType::Bool => Value::from_array(x.mapv(|x_| x_ != 0.))?.into_dyn(),
+            _ => return Err(anyhow::anyhow!("Preprocessing not implemented for dtype: {:?}", dtype)),
         };
 
-        Ok(x)
+        Ok(x_val)
     }
 
-    fn postprocess(x: &DynValue, dtype: &TensorElementType) -> Result<Array<f32, IxDyn>> {
-        fn _extract_and_convert<T>(x: &DynValue, map_fn: impl Fn(T) -> f32) -> Array<f32, IxDyn>
+    fn postprocess(x_dyn: &DynValue, dtype: &TensorElementType) -> Result<Array<f32, IxDyn>> {
+        fn _extract_and_convert<T>(value: &DynValue, map_fn: impl Fn(T) -> f32) -> Array<f32, IxDyn>
         where
             T: Clone + 'static + ort::tensor::PrimitiveTensorElementType,
         {
-            match x.try_extract_tensor::<T>() {
+            match value.try_extract_tensor::<T>() { // This seems to return Result<(&Shape, &[T])> for primitive T
                 Err(err) => {
                     debug!("Failed to extract from ort outputs: {:?}. A default value has been generated.", err);
                     Array::zeros(0).into_dyn()
                 }
-                Ok(x) => x.view().mapv(map_fn).into_owned(),
+                Ok((shape, data_slice)) => { // Deconstruct the tuple as per E0599
+                    let nd_shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+                    // This is unsafe because from_shape_ptr doesn't check if the total number of elements
+                    // matches the slice length. T comes from PrimitiveTensorElementType which should be safe.
+                    let array_view = unsafe {
+                        ndarray::ArrayView::from_shape_ptr(ndarray::IxDyn(&nd_shape), data_slice.as_ptr())
+                    };
+                    array_view.mapv(map_fn).into_owned()
+                }
             }
         }
-        let x = match dtype {
-            TensorElementType::Float32 => _extract_and_convert::<f32>(x, |x| x),
-            TensorElementType::Float16 => _extract_and_convert::<f16>(x, f16::to_f32),
-            TensorElementType::Bfloat16 => _extract_and_convert::<bf16>(x, bf16::to_f32),
-            TensorElementType::Float64 => _extract_and_convert::<f64>(x, |x| x as f32),
-            TensorElementType::Int64 => _extract_and_convert::<i64>(x, |x| x as f32),
-            TensorElementType::Int32 => _extract_and_convert::<i32>(x, |x| x as f32),
-            TensorElementType::Int16 => _extract_and_convert::<i16>(x, |x| x as f32),
-            TensorElementType::Int8 => _extract_and_convert::<i8>(x, |x| x as f32),
-            TensorElementType::Uint64 => _extract_and_convert::<u64>(x, |x| x as f32),
-            TensorElementType::Uint32 => _extract_and_convert::<u32>(x, |x| x as f32),
-            TensorElementType::Uint16 => _extract_and_convert::<u16>(x, |x| x as f32),
-            TensorElementType::Uint8 => _extract_and_convert::<u8>(x, |x| x as f32),
-            TensorElementType::Bool => _extract_and_convert::<bool>(x, |x| x as u8 as f32),
-            _ => return Err(anyhow::anyhow!("Unsupported ort tensor type: {:?}", dtype)),
+        let x_val = match dtype {
+            TensorElementType::Float32 => _extract_and_convert::<f32>(x_dyn, |val| val),
+            TensorElementType::Float16 => _extract_and_convert::<f16>(x_dyn, f16::to_f32),
+            TensorElementType::Bfloat16 => _extract_and_convert::<bf16>(x_dyn, bf16::to_f32),
+            TensorElementType::Float64 => _extract_and_convert::<f64>(x_dyn, |val| val as f32),
+            TensorElementType::Int64 => _extract_and_convert::<i64>(x_dyn, |val| val as f32),
+            TensorElementType::Int32 => _extract_and_convert::<i32>(x_dyn, |val| val as f32),
+            TensorElementType::Int16 => _extract_and_convert::<i16>(x_dyn, |val| val as f32),
+            TensorElementType::Int8 => _extract_and_convert::<i8>(x_dyn, |val| val as f32),
+            TensorElementType::Uint64 => _extract_and_convert::<u64>(x_dyn, |val| val as f32),
+            TensorElementType::Uint32 => _extract_and_convert::<u32>(x_dyn, |val| val as f32),
+            TensorElementType::Uint16 => _extract_and_convert::<u16>(x_dyn, |val| val as f32),
+            TensorElementType::Uint8 => _extract_and_convert::<u8>(x_dyn, |val| val as f32),
+            TensorElementType::Bool => _extract_and_convert::<bool>(x_dyn, |val| val as u8 as f32),
+            _ => return Err(anyhow::anyhow!("Unsupported ort tensor type in postprocess: {:?}", dtype)),
         };
 
-        Ok(x)
+        Ok(x_val)
     }
 
     #[allow(unused_variables)]
@@ -557,6 +570,7 @@ impl Engine {
             | TensorElementType::Int16
             | TensorElementType::Uint16 => 2, // f16, bf16, i16, u16
             TensorElementType::Uint8 | TensorElementType::Int8 | TensorElementType::Bool => 1, // u8, i8, bool
+            _ => unimplemented!("Size not defined for TensorElementType: {:?}", x),
         }
     }
 
